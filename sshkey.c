@@ -301,6 +301,44 @@ sshkey_is_cert(const struct sshkey *k)
 	return sshkey_type_is_cert(k->type);
 }
 
+int
+sshkey_is_private(const struct sshkey *k)
+{
+	switch (k->type) {
+#ifdef WITH_OPENSSL
+	case KEY_RSA:
+	case KEY_RSA_CERT:
+		if (k->rsa && k->rsa->d && k->rsa->q && k->rsa->p &&
+			k->rsa->iqmp &&
+			!BN_is_zero(k->rsa->d) &&
+			!BN_is_zero(k->rsa->q) &&
+			!BN_is_zero(k->rsa->p) &&
+			!BN_is_zero(k->rsa->iqmp))
+				return 1;
+		break;
+	case KEY_DSA:
+	case KEY_DSA_CERT:
+		if (k->dsa && k->dsa->priv_key)
+			return 1;
+		break;
+	case KEY_ECDSA:
+	case KEY_ECDSA_CERT:
+		if (k->ecdsa && EC_KEY_get0_private_key(k->ecdsa))
+			return 1;
+		break;
+#endif /* WITH_OPENSSL */
+	case KEY_ED25519:
+	case KEY_ED25519_CERT:
+		if (k->ed25519_sk)
+			return 1;
+		break;
+	case KEY_UNSPEC:
+		break;
+	}
+
+	return 0;
+}
+
 /* Return the cert-less equivalent to a certified key type */
 int
 sshkey_type_plain(int type)
