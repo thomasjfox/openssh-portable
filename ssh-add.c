@@ -184,6 +184,49 @@ delete_all(int agent_fd)
 }
 
 static int
+add_certificate_only(int agent_fd, const char *filename)
+{
+	struct sshkey *cert = NULL;
+	char *comment = NULL;
+	int r, ret = -1;
+
+	/* Load certificate */
+	if ((r = sshkey_load_public(filename, &cert, &comment)) != 0) {
+		if (r != SSH_ERR_SYSTEM_ERROR || errno != ENOENT)
+			error("Failed to load certificate \"%s\": %s",
+			    filename, ssh_err(r));
+		goto out;
+	}
+	if (!sshkey_is_cert(cert)) {
+		error("Not a certificate: %s", filename);
+		goto out;
+	}
+
+        /* Add empty private key fields for serialization */
+	if ((r = sshkey_add_private(cert)) != 0)
+		goto out;
+
+	if ((r = ssh_add_identity_constrained(agent_fd, cert, comment,
+	    lifetime, confirm)) != 0) {
+		error("Certificate %s (%s) add failed: %s", filename,
+		    cert->cert->key_id, ssh_err(r));
+		goto out;
+	}
+	ret = 0;
+	fprintf(stderr, "Certificate added: %s (%s)\n", filename,
+	    cert->cert->key_id);
+	if (lifetime != 0)
+		fprintf(stderr, "Lifetime set to %d seconds\n", lifetime);
+	if (confirm != 0)
+		fprintf(stderr, "The user must confirm each use of the key\n");
+ out:
+	free(comment);
+	sshkey_free(cert);
+
+	return ret;
+}
+
+static int
 add_file(int agent_fd, const char *filename, int key_only, int qflag)
 {
 	struct sshkey *private, *cert;
@@ -432,13 +475,16 @@ lock_agent(int agent_fd, int lock)
 }
 
 static int
-do_file(int agent_fd, int deleting, int key_only, char *file, int qflag)
+do_file(int agent_fd, int deleting, int key_only, int cert_only, char *file, int qflag)
 {
 	if (deleting) {
 		if (delete_file(agent_fd, file, key_only, qflag) == -1)
 			return -1;
 	} else {
-		if (add_file(agent_fd, file, key_only, qflag) == -1)
+		if (cert_only) {
+			if (add_certificate_only(agent_fd, file) == -1)
+				return -1;
+		} else if (add_file(agent_fd, file, key_only, qflag) == -1)
 			return -1;
 	}
 	return 0;
@@ -453,6 +499,7 @@ usage(void)
 	fprintf(stderr, "  -E hash     Specify hash algorithm used for fingerprints.\n");
 	fprintf(stderr, "  -L          List public key parameters of all identities.\n");
 	fprintf(stderr, "  -k          Load only keys and not certificates.\n");
+	fprintf(stderr, "  -p          Load additional certificate. Private key must be loaded.\n");
 	fprintf(stderr, "  -c          Require confirmation to sign using identities\n");
 	fprintf(stderr, "  -t life     Set lifetime (in seconds) when adding identities.\n");
 	fprintf(stderr, "  -d          Delete identity.\n");
@@ -471,7 +518,7 @@ main(int argc, char **argv)
 	extern int optind;
 	int agent_fd;
 	char *pkcs11provider = NULL;
-	int r, i, ch, deleting = 0, ret = 0, key_only = 0;
+	int r, i, ch, deleting = 0, ret = 0, key_only = 0, cert_only = 0;
 	int xflag = 0, lflag = 0, Dflag = 0, qflag = 0;
 
 	ssh_malloc_init();	/* must be called before any mallocs */
@@ -500,7 +547,7 @@ main(int argc, char **argv)
 		exit(2);
 	}
 
-	while ((ch = getopt(argc, argv, "klLcdDxXE:e:qs:t:")) != -1) {
+	while ((ch = getopt(argc, argv, "kplLcdDxXE:e:qs:t:")) != -1) {
 		switch (ch) {
 		case 'E':
 			fingerprint_hash = ssh_digest_alg_by_name(optarg);
@@ -508,7 +555,14 @@ main(int argc, char **argv)
 				fatal("Invalid hash algorithm \"%s\"", optarg);
 			break;
 		case 'k':
+			if (cert_only)
+				fatal("-k and -p are incompatible");
 			key_only = 1;
+			break;
+		case 'p':
+			if (key_only)
+				fatal("-k and -p are incompatible");
+			cert_only = 1;
 			break;
 		case 'l':
 		case 'L':
@@ -596,7 +650,7 @@ main(int argc, char **argv)
 			    default_files[i]);
 			if (stat(buf, &st) < 0)
 				continue;
-			if (do_file(agent_fd, deleting, key_only, buf,
+			if (do_file(agent_fd, deleting, key_only, cert_only, buf,
 			    qflag) == -1)
 				ret = 1;
 			else
@@ -606,7 +660,7 @@ main(int argc, char **argv)
 			ret = 1;
 	} else {
 		for (i = 0; i < argc; i++) {
-			if (do_file(agent_fd, deleting, key_only,
+			if (do_file(agent_fd, deleting, key_only, cert_only,
 			    argv[i], qflag) == -1)
 				ret = 1;
 		}

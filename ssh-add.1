@@ -121,6 +121,10 @@ Remove keys provided by the PKCS#11 shared library
 .It Fl k
 When loading keys into or deleting keys from the agent, process plain private
 keys only and skip certificates.
+.It Fl p
+Load additional certificate for already loaded private key.
+Will refuse to load the certificate if no matching key is found.
+Useful if the private key is stored on a PKCS#11 hardware token.
 .It Fl L
 Lists public key parameters of all identities currently represented
 by the agent.
