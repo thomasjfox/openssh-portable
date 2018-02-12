@@ -114,9 +114,15 @@ typedef struct {
 u_int sockets_alloc = 0;
 SocketEntry *sockets = NULL;
 
+typedef struct refcountkey {
+	struct sshkey *key;
+	int count;
+} RefcountKey;
+
 typedef struct identity {
 	TAILQ_ENTRY(identity) next;
-	struct sshkey *key;
+	RefcountKey *idkey;
+	RefcountKey *shadowed_key;
 	char *comment;
 	char *provider;
 	time_t death;
@@ -181,27 +187,69 @@ idtab_init(void)
 	idtab->nentries = 0;
 }
 
+static RefcountKey *
+refkey_new(struct sshkey *key)
+{
+	RefcountKey *ref = xcalloc(1, sizeof(RefcountKey));
+
+	ref->key = key;
+	ref->count = 1;
+
+	return ref;
+}
+
+static RefcountKey *
+refkey_addref(RefcountKey *refkey)
+{
+	++refkey->count;
+	return refkey;
+}
+
+static void refkey_unref(RefcountKey *refkey)
+{
+	if (refkey && --refkey->count <= 0) {
+		sshkey_free(refkey->key);
+		free(refkey);
+	}
+}
+
 static void
 free_identity(Identity *id)
 {
-	sshkey_free(id->key);
+	refkey_unref(id->idkey);
+	refkey_unref(id->shadowed_key);
 	free(id->provider);
 	free(id->comment);
 	free(id);
 }
 
-/* return matching private key for given public key */
+/* return matching Identity for given public key */
 static Identity *
 lookup_identity(struct sshkey *key)
 {
 	Identity *id;
 
 	TAILQ_FOREACH(id, &idtab->idlist, next) {
-		if (sshkey_equal(key, id->key))
+		if (sshkey_equal(key, id->idkey->key))
 			return (id);
 	}
 	return (NULL);
 }
+
+/* return matching private key for given public key */
+static Identity *
+lookup_identity_unshadowed_key(struct sshkey *key)
+{
+	Identity *id;
+
+	TAILQ_FOREACH(id, &idtab->idlist, next) {
+		if (sshkey_equal_public(key, id->idkey->key) &&
+		    id->shadowed_key == NULL)
+			return (id);
+	}
+	return (NULL);
+}
+
 
 /* Check confirmation of keysign request */
 static int
@@ -210,7 +258,7 @@ confirm_key(Identity *id)
 	char *p;
 	int ret = -1;
 
-	p = sshkey_fingerprint(id->key, fingerprint_hash, SSH_FP_DEFAULT);
+	p = sshkey_fingerprint(id->idkey->key, fingerprint_hash, SSH_FP_DEFAULT);
 	if (p != NULL &&
 	    ask_permission("Allow use of key %s?\nKey fingerprint %s.",
 	    id->comment, p))
@@ -245,7 +293,7 @@ process_request_identities(SocketEntry *e)
 	    (r = sshbuf_put_u32(msg, idtab->nentries)) != 0)
 		fatal("%s: buffer error: %s", __func__, ssh_err(r));
 	TAILQ_FOREACH(id, &idtab->idlist, next) {
-		if ((r = sshkey_puts(id->key, msg)) != 0 ||
+		if ((r = sshkey_puts(id->idkey->key, msg)) != 0 ||
 		    (r = sshbuf_put_cstring(msg, id->comment)) != 0) {
 			error("%s: put key/comment: %s", __func__,
 			    ssh_err(r));
@@ -280,7 +328,7 @@ process_sign_request2(SocketEntry *e)
 	u_int compat = 0, flags;
 	int r, ok = -1;
 	struct sshbuf *msg;
-	struct sshkey *key = NULL;
+	struct sshkey *key = NULL, *sign_key = NULL;
 	struct identity *id;
 
 	if ((msg = sshbuf_new()) == NULL)
@@ -300,7 +348,13 @@ process_sign_request2(SocketEntry *e)
 		verbose("%s: user refused key", __func__);
 		goto send;
 	}
-	if ((r = sshkey_sign(id->key, &signature, &slen,
+
+	if (id->shadowed_key)
+		sign_key = id->shadowed_key->key;
+	else
+		sign_key = id->idkey->key;
+
+        if ((r = sshkey_sign(sign_key, &signature, &slen,
 	    data, dlen, agent_decode_alg(key, flags), compat)) != 0) {
 		error("%s: sshkey_sign: %s", __func__, ssh_err(r));
 		goto send;
@@ -443,12 +497,39 @@ process_add_identity(SocketEntry *e)
 		}
 	}
 
-	success = 1;
 	if (lifetime && !death)
 		death = monotime() + lifetime;
+
+	/* handle additional certificates for an existing private key */
+	if (!sshkey_is_private(k)) {
+		id = lookup_identity_unshadowed_key(k);
+		/* ensure we have a private key and this cert is new */
+		if (id != NULL && lookup_identity(k) == NULL) {
+			Identity *certid = xcalloc(1, sizeof(Identity));
+			certid->idkey = refkey_new(k);
+			certid->shadowed_key = refkey_addref(id->idkey);
+			if (id->provider)
+				certid->provider = xstrdup(id->provider);
+			if (id->comment)
+				certid->comment = xstrdup(id->comment); /* XXX */
+			certid->death = death;
+			certid->confirm = confirm | id->confirm;
+
+			TAILQ_INSERT_TAIL(&idtab->idlist, certid, next);
+			idtab->nentries++;
+			success = 1;
+		} else
+			sshkey_free(k);
+
+		free(comment);
+		goto send;
+	}
+
+	success = 1;
+
 	if ((id = lookup_identity(k)) == NULL) {
 		id = xcalloc(1, sizeof(Identity));
-		id->key = k;
+		id->idkey = refkey_new(k);
 		TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
 		/* Increment the number of identities. */
 		idtab->nentries++;
@@ -590,7 +671,7 @@ process_add_smartcard_key(SocketEntry *e)
 		k = keys[i];
 		if (lookup_identity(k) == NULL) {
 			id = xcalloc(1, sizeof(Identity));
-			id->key = k;
+			id->idkey = refkey_new(k);
 			id->provider = xstrdup(canonical_provider);
 			id->comment = xstrdup(canonical_provider); /* XXX */
 			id->death = death;
